@@ -9,7 +9,7 @@ import torchvision.transforms as T
 
 
 def infer(model, loader, tta_level=0):
-    
+
     def infer_basic(inputs, net):
         return net(inputs).clone()
 
@@ -18,12 +18,12 @@ def infer(model, loader, tta_level=0):
 
     def infer_mirror_translate(inputs, net):
         logits = infer_mirror(inputs, net)
-        pad = 1 
+        pad = 1
         padded_inputs = F.pad(inputs, (pad,)*4, 'reflect')
-        inputs_translate_list = [ 
+        inputs_translate_list = [
             padded_inputs[:, :, 0:32, 0:32],
             padded_inputs[:, :, 2:34, 2:34],
-        ]   
+        ]
         logits_translate_list = [infer_mirror(inputs_translate, net)
                                  for inputs_translate in inputs_translate_list]
         logits_translate = torch.stack(logits_translate_list).mean(0)
@@ -81,7 +81,7 @@ def make_random_square_masks(inputs, size):
     # measure distance, using the center as a reference point
     corner_y_dists = torch.arange(h, device=inputs.device).view(1, 1, h, 1) - corner_y.view(-1, 1, 1, 1)
     corner_x_dists = torch.arange(w, device=inputs.device).view(1, 1, 1, w) - corner_x.view(-1, 1, 1, 1)
-    
+
     mask_y = (corner_y_dists >= 0) * (corner_y_dists < size)
     mask_x = (corner_x_dists >= 0) * (corner_x_dists < size)
 
@@ -124,7 +124,7 @@ class CifarLoader:
 
     def __len__(self):
         return len(self.images)//self.batch_size if self.drop_last else ceil(len(self.images)/self.batch_size)
-    
+
     def __setattr__(self, k, v):
         if k in ('images', 'labels'):
             assert self.epoch == 0, 'Changing images or labels is only unsupported before iteration.'
@@ -365,4 +365,3 @@ def train(train_loader, epochs, label_smoothing, learning_rate, bias_scaler, mom
         print_training_details(locals(), is_final_entry=True)
 
     return model
-
