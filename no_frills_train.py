@@ -10,7 +10,7 @@ loader = CifarLoader(
     altflip=False,
 )
 
-net = train_nofrills(label_smoothing=0)
+net = train94(label_smoothing=0)
 logits = infer(net, loader)
 conf = logits.log_softmax(1).amax(1) # confidence
-print(conf)
+# print(conf)
