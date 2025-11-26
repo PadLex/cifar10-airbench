@@ -6,3 +6,7 @@ upload.sh
 trash/
 logs/
 
+.venv/
+.idea/
+.vscode/
+.DS_Store
