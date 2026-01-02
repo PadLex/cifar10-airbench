@@ -1,5 +1,6 @@
 """
 airbench94_muon.py
+
 Runs in 2.59 seconds on a 400W NVIDIA A100 using torch==2.4.1
 Attains 94.01 mean accuracy (n=200 trials)
 Descends from https://github.com/tysam-code/hlb-CIFAR10/blob/main/main.py
@@ -10,12 +11,8 @@ Descends from https://github.com/tysam-code/hlb-CIFAR10/blob/main/main.py
 #############################################
 
 import os
-import sys
-with open(sys.argv[0]) as f:
-    code = f.read()
 import uuid
 from math import ceil
-
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -36,7 +33,7 @@ def zeropower_via_newtonschulz5(G, steps=3, eps=1e-7):
     of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
     zero even beyond the point where the iteration no longer converges all the way to one everywhere
     on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' \sim Uniform(0.5, 1.5), which turns out not to hurt model
+    where S' is diagonal with S_{ii}' \\sim Uniform(0.5, 1.5), which turns out not to hurt model
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
     assert len(G.shape) == 2
@@ -54,12 +51,12 @@ def zeropower_via_newtonschulz5(G, steps=3, eps=1e-7):
     return X
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=1e-3, momentum=0, nesterov=False):
+    def __init__(self, params, lr=1e-3, momentum=0.0, nesterov=False):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
         if momentum < 0.0:
             raise ValueError(f"Invalid momentum value: {momentum}")
-        if nesterov and momentum <= 0:
+        if nesterov and momentum <= 0.0:
             raise ValueError("Nesterov momentum requires a momentum")
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov)
         super().__init__(params, defaults)
@@ -83,6 +80,99 @@ class Muon(torch.optim.Optimizer):
                 p.data.mul_(len(p.data)**0.5 / p.data.norm()) # normalize the weight
                 update = zeropower_via_newtonschulz5(g.reshape(len(g), -1)).view(g.shape) # whiten the update
                 p.data.add_(update, alpha=-lr) # take a step
+
+#############################################
+#            Optimizer Configuration        #
+#############################################
+
+class OptimizerConfig:
+    """Base class for optimizer configurations"""
+    def __init__(self, name, batch_size=2000, bias_lr=0.053, head_lr=0.67, wd_factor=2e-6):
+        self.name = name
+        self.batch_size = batch_size
+        self.bias_lr = bias_lr
+        self.head_lr = head_lr
+        self.wd = wd_factor * batch_size
+    
+    def create_optimizers(self, model):
+        """Create and return optimizer(s) for the model. Must be implemented by subclasses."""
+        raise NotImplementedError
+
+class MuonConfig(OptimizerConfig):
+    def __init__(self, batch_size=2000, bias_lr=0.053, head_lr=0.67, wd_factor=2e-6,
+                 muon_lr=0.24, muon_momentum=0.6, muon_nesterov=True,
+                 sgd_momentum=0.85, sgd_nesterov=True):
+        super().__init__('Muon', batch_size, bias_lr, head_lr, wd_factor)
+        self.muon_lr = muon_lr
+        self.muon_momentum = muon_momentum
+        self.muon_nesterov = muon_nesterov
+        self.sgd_momentum = sgd_momentum
+        self.sgd_nesterov = sgd_nesterov
+    
+    def create_optimizers(self, model):
+        filter_params = [p for p in model.parameters() if len(p.shape) == 4 and p.requires_grad]
+        norm_biases = [p for n, p in model.named_parameters() if "norm" in n and p.requires_grad]
+        
+        param_configs = [
+            dict(params=[model.whiten.bias], lr=self.bias_lr, weight_decay=self.wd/self.bias_lr),
+            dict(params=norm_biases, lr=self.bias_lr, weight_decay=self.wd/self.bias_lr),
+            dict(params=[model.head.weight], lr=self.head_lr, weight_decay=self.wd/self.head_lr)
+        ]
+        
+        optimizer1 = torch.optim.SGD(param_configs, momentum=self.sgd_momentum, 
+                                     nesterov=self.sgd_nesterov, fused=True)
+        optimizer2 = Muon(filter_params, lr=self.muon_lr, momentum=self.muon_momentum, 
+                         nesterov=self.muon_nesterov)
+        
+        return [optimizer1, optimizer2]
+
+class SGDConfig(OptimizerConfig):
+    def __init__(self, batch_size=2000, bias_lr=0.053, head_lr=0.67, wd_factor=2e-6,
+                 filter_lr=0.24, momentum=0.9, nesterov=True):
+        super().__init__('SGD', batch_size, bias_lr, head_lr, wd_factor)
+        self.filter_lr = filter_lr
+        self.momentum = momentum
+        self.nesterov = nesterov
+    
+    def create_optimizers(self, model):
+        filter_params = [p for p in model.parameters() if len(p.shape) == 4 and p.requires_grad]
+        norm_biases = [p for n, p in model.named_parameters() if "norm" in n and p.requires_grad]
+        
+        param_configs = [
+            dict(params=[model.whiten.bias], lr=self.bias_lr, weight_decay=self.wd/self.bias_lr),
+            dict(params=norm_biases, lr=self.bias_lr, weight_decay=self.wd/self.bias_lr),
+            dict(params=[model.head.weight], lr=self.head_lr, weight_decay=self.wd/self.head_lr),
+            dict(params=filter_params, lr=self.filter_lr, weight_decay=self.wd/self.filter_lr)
+        ]
+        
+        optimizer = torch.optim.SGD(param_configs, momentum=self.momentum, 
+                                   nesterov=self.nesterov, fused=True)
+        
+        return [optimizer]
+
+# Example for future Adam support:
+# class AdamConfig(OptimizerConfig):
+#     def __init__(self, batch_size=2000, bias_lr=0.053, head_lr=0.67, wd_factor=2e-6,
+#                  filter_lr=0.001, betas=(0.9, 0.999), eps=1e-8):
+#         super().__init__('Adam', batch_size, bias_lr, head_lr, wd_factor)
+#         self.filter_lr = filter_lr
+#         self.betas = betas
+#         self.eps = eps
+#     
+#     def create_optimizers(self, model):
+#         filter_params = [p for p in model.parameters() if len(p.shape) == 4 and p.requires_grad]
+#         norm_biases = [p for n, p in model.named_parameters() if "norm" in n and p.requires_grad]
+#         
+#         param_configs = [
+#             dict(params=[model.whiten.bias], lr=self.bias_lr, weight_decay=self.wd/self.bias_lr),
+#             dict(params=norm_biases, lr=self.bias_lr, weight_decay=self.wd/self.bias_lr),
+#             dict(params=[model.head.weight], lr=self.head_lr, weight_decay=self.wd/self.head_lr),
+#             dict(params=filter_params, lr=self.filter_lr, weight_decay=self.wd/self.filter_lr)
+#         ]
+#         
+#         optimizer = torch.optim.Adam(param_configs, betas=self.betas, eps=self.eps, fused=True)
+#         
+#         return [optimizer]
 
 #############################################
 #                DataLoader                 #
@@ -239,10 +329,9 @@ class CifarNet(nn.Module):
 
     def reset(self):
         for m in self.modules():
-            if type(m) in (nn.Conv2d, Conv, BatchNorm, nn.Linear):
+            # Reset standard layers
+            if isinstance(m, (nn.Conv2d, nn.Linear, nn.BatchNorm2d)):
                 m.reset_parameters()
-        w = self.head.weight.data
-        w *= 1 / w.std()
 
     def init_whiten(self, train_images, eps=5e-4):
         c, (h, w) = train_images.shape[1], self.whiten.weight.shape[2:]
@@ -337,12 +426,14 @@ def evaluate(model, loader, tta_level=0):
 #                Training                  #
 ############################################
 
-def main(run, model):
-
-    batch_size = 2000
-    bias_lr = 0.053
-    head_lr = 0.67
-    wd = 2e-6 * batch_size
+def train(run, model, optimizer_config=None, verbose=False, callback=None):
+    if optimizer_config is None:
+        optimizer_config = MuonConfig()
+    
+    batch_size = optimizer_config.batch_size
+    bias_lr = optimizer_config.bias_lr
+    head_lr = optimizer_config.head_lr
+    wd = optimizer_config.wd
 
     test_loader = CifarLoader("cifar10", train=False, batch_size=2000)
     train_loader = CifarLoader("cifar10", train=True, batch_size=batch_size, aug=dict(flip=True, translate=2))
@@ -352,15 +443,9 @@ def main(run, model):
     total_train_steps = ceil(8 * len(train_loader))
     whiten_bias_train_steps = ceil(3 * len(train_loader))
 
-    # Create optimizers and learning rate schedulers
-    filter_params = [p for p in model.parameters() if len(p.shape) == 4 and p.requires_grad]
-    norm_biases = [p for n, p in model.named_parameters() if "norm" in n and p.requires_grad]
-    param_configs = [dict(params=[model.whiten.bias], lr=bias_lr, weight_decay=wd/bias_lr),
-                     dict(params=norm_biases,         lr=bias_lr, weight_decay=wd/bias_lr),
-                     dict(params=[model.head.weight], lr=head_lr, weight_decay=wd/head_lr)]
-    optimizer1 = torch.optim.SGD(param_configs, momentum=0.85, nesterov=True, fused=True)
-    optimizer2 = Muon(filter_params, lr=0.24, momentum=0.6, nesterov=True)
-    optimizers = [optimizer1, optimizer2]
+    # Create optimizers using the configuration
+    optimizers = optimizer_config.create_optimizers(model)
+    
     for opt in optimizers:
         for group in opt.param_groups:
             group["initial_lr"] = group["lr"]
@@ -386,21 +471,32 @@ def main(run, model):
     model.init_whiten(train_images)
     stop_timer()
 
-    for epoch in range(ceil(total_train_steps / len(train_loader))):
+    epochs = ceil(total_train_steps / len(train_loader))
+    for epoch in range(epochs):
 
         ####################
         #     Training     #
         ####################
+
+        train_acc = []
 
         start_timer()
         model.train()
         for inputs, labels in train_loader:
             outputs = model(inputs, whiten_bias_grad=(step < whiten_bias_train_steps))
             F.cross_entropy(outputs, labels, label_smoothing=0.2, reduction="sum").backward()
-            for group in optimizer1.param_groups[:1]:
-                group["lr"] = group["initial_lr"] * (1 - step / whiten_bias_train_steps)
-            for group in optimizer1.param_groups[1:]+optimizer2.param_groups:
-                group["lr"] = group["initial_lr"] * (1 - step / total_train_steps)
+            train_acc.append((outputs.detach().argmax(1) == labels).float().mean().item())
+            
+            # Update learning rates
+            for opt in optimizers:
+                for i, group in enumerate(opt.param_groups):
+                    # Check if this is the whiten bias group (first group in first optimizer)
+                    is_whiten_bias = (opt == optimizers[0] and i == 0)
+                    if is_whiten_bias:
+                        group["lr"] = group["initial_lr"] * (1 - step / whiten_bias_train_steps)
+                    else:
+                        group["lr"] = group["initial_lr"] * (1 - step / total_train_steps)
+            
             for opt in optimizers:
                 opt.step()
             model.zero_grad(set_to_none=True)
@@ -414,10 +510,13 @@ def main(run, model):
         ####################
 
         # Save the accuracy and loss from the last training batch of the epoch
-        train_acc = (outputs.detach().argmax(1) == labels).float().mean().item()
         val_acc = evaluate(model, test_loader, tta_level=0)
-        print_training_details(locals(), is_final_entry=False)
-        run = None # Only print the run number once
+
+        if callback is not None:
+            callback(epoch, model, train_acc, val_acc)
+
+        if verbose:
+            print(f"Run {run} | Epoch {epoch+1}/{epochs} | Train Acc: {sum(train_acc)/len(train_acc):.4f} | Val Acc: {val_acc:.4f}")
 
     ####################
     #  TTA Evaluation  #
@@ -427,24 +526,25 @@ def main(run, model):
     tta_val_acc = evaluate(model, test_loader, tta_level=2)
     stop_timer()
     epoch = "eval"
-    print_training_details(locals(), is_final_entry=True)
+
+    if verbose:
+        print(f"Final TTA Acc (Epoch {epochs}): {tta_val_acc:.4f}")
 
     return tta_val_acc
 
 if __name__ == "__main__":
+    device = "cuda"
+    model = CifarNet().to(device).to(memory_format=torch.channels_last)
+    model = torch.compile(model, mode="max-autotune")
 
-    # We re-use the compiled model between runs to save the non-data-dependent compilation time
-    model = CifarNet().cuda().to(memory_format=torch.channels_last)
-    model.compile(mode="max-autotune")
+    # 1. Warmup
+    print("Performing Warmup...")
+    train("Warmup", model, MuonConfig(batch_size=2000))
 
-    print_columns(logging_columns_list, is_head=True)
-    main("warmup", model)
-    accs = torch.tensor([main(run, model) for run in range(200)])
-    print("Mean: %.4f    Std: %.4f" % (accs.mean(), accs.std()))
+    # 2. Test Muon
+    muon_accs = torch.tensor([train(run, model, MuonConfig(), verbose=True) for run in range(30)])
+    print("\nMuon - Mean: %.4f    Std: %.4f" % (muon_accs.mean(), muon_accs.std()))
 
-    log_dir = os.path.join("logs", str(uuid.uuid4()))
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, "log.pt")
-    torch.save(dict(code=code, accs=accs), log_path)
-    print(os.path.abspath(log_path))
-
+    # 3. Test SGD
+    sgd_accs = torch.tensor([train(run, model, SGDConfig(), verbose=True) for run in range(30)])
+    print("\nSGD  - Mean: %.4f    Std: %.4f" % (sgd_accs.mean(), sgd_accs.std()))
