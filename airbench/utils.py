@@ -236,7 +236,7 @@ def print_training_details(variables, is_final_entry):
 ############################################
 
 def train(train_loader, epochs, label_smoothing, learning_rate, bias_scaler, momentum, weight_decay,
-          whiten_bias_epochs, tta_level, make_net, run, verbose, lr_peak=0.23, lr_end=0.07):
+          whiten_bias_epochs, tta_level, make_net, run, verbose, lr_peak=0.23, lr_end=0.07, callback=None):
 
     train_loader.epoch = 0
 
@@ -318,6 +318,9 @@ def train(train_loader, epochs, label_smoothing, learning_rate, bias_scaler, mom
             scheduler.step()
 
             current_steps += 1
+
+            if callback is not None:
+                callback(current_steps, model)
 
             if current_steps % 5 == 0:
                 lookahead_state.update(model, decay=alpha_schedule[current_steps].item())
