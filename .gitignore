@@ -5,4 +5,4 @@ dist/
 upload.sh
 trash/
 logs/
-
+slurm/out/*
