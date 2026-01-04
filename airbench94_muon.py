@@ -1,9 +1,5 @@
 """
-airbench94_muon.py
-
-Runs in 2.59 seconds on a 400W NVIDIA A100 using torch==2.4.1
-Attains 94.01 mean accuracy (n=200 trials)
-Descends from https://github.com/tysam-code/hlb-CIFAR10/blob/main/main.py
+Descends from airbench94_muon.py
 """
 
 #############################################
@@ -471,6 +467,9 @@ def train(run, model, optimizer_config=None, verbose=False, callback=None):
     model.init_whiten(train_images)
     stop_timer()
 
+    if callback is not None:
+        callback(0, model, 0, 0)
+
     epochs = ceil(total_train_steps / len(train_loader))
     for epoch in range(epochs):
 
@@ -478,14 +477,11 @@ def train(run, model, optimizer_config=None, verbose=False, callback=None):
         #     Training     #
         ####################
 
-        train_acc = []
-
         start_timer()
         model.train()
         for inputs, labels in train_loader:
             outputs = model(inputs, whiten_bias_grad=(step < whiten_bias_train_steps))
             F.cross_entropy(outputs, labels, label_smoothing=0.2, reduction="sum").backward()
-            train_acc.append((outputs.detach().argmax(1) == labels).float().mean().item())
             
             # Update learning rates
             for opt in optimizers:
@@ -511,12 +507,13 @@ def train(run, model, optimizer_config=None, verbose=False, callback=None):
 
         # Save the accuracy and loss from the last training batch of the epoch
         val_acc = evaluate(model, test_loader, tta_level=0)
+        train_acc = (outputs.detach().argmax(1) == labels).float().mean().item()
 
         if callback is not None:
-            callback(epoch, model, train_acc, val_acc)
+            callback(epoch + 1, model, train_acc, val_acc)
 
         if verbose:
-            print(f"Run {run} | Epoch {epoch+1}/{epochs} | Train Acc: {sum(train_acc)/len(train_acc):.4f} | Val Acc: {val_acc:.4f}")
+            print(f"Run {run} | Epoch {epoch+1}/{epochs} | Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}")
 
     ####################
     #  TTA Evaluation  #
@@ -542,9 +539,9 @@ if __name__ == "__main__":
     train("Warmup", model, MuonConfig(batch_size=2000))
 
     # 2. Test Muon
-    muon_accs = torch.tensor([train(run, model, MuonConfig(), verbose=True) for run in range(30)])
+    muon_accs = torch.tensor([train(run, model, MuonConfig(), verbose=True) for run in range(10)])
     print("\nMuon - Mean: %.4f    Std: %.4f" % (muon_accs.mean(), muon_accs.std()))
 
     # 3. Test SGD
-    sgd_accs = torch.tensor([train(run, model, SGDConfig(), verbose=True) for run in range(30)])
+    sgd_accs = torch.tensor([train(run, model, SGDConfig(), verbose=True) for run in range(10)])
     print("\nSGD  - Mean: %.4f    Std: %.4f" % (sgd_accs.mean(), sgd_accs.std()))

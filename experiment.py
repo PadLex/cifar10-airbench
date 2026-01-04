@@ -1,12 +1,16 @@
+from typing import final
 import uuid
-from airbench94_muon import CifarNet, train, MuonConfig, SGDConfig, CifarLoader
+from airbench94_muon import CifarNet, train, MuonConfig, SGDConfig, CifarLoader, BatchNorm
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 from pyhessian import hessian
 from itertools import islice
-import loss_landscapes
-import loss_landscapes.metrics as metrics
+# import loss_landscapes
+# import loss_landscapes.metrics as metrics
+import torch.multiprocessing as mp
+import numpy as np
 
 import copy
 
@@ -96,61 +100,57 @@ def pyhessian_sharpness(model, loader, num_batches=10):
 
     return relative_sharpness
 
-# @torch.no_grad()
-# def get_sam_sharpness(model, loader, rho=0.05, num_batches=10):
-#     model.eval()
-#     device = next(model.parameters()).device
-#     total_sharpness = 0.0
-
-#     g = torch.Generator()
-#     g.manual_seed(42) 
-#     loader_iter = iter(loader)
-    
-#     for batch_idx, (inputs, targets) in enumerate(loader_iter):
-#         if batch_idx >= num_batches:
-#             break
-            
-#         inputs, targets = inputs.to(device), targets.to(device)
-        
-#         # 1. Compute base loss and gradients
-#         with torch.enable_grad():
-#             outputs = model(inputs)
-#             base_loss = F.cross_entropy(outputs, targets)
-#             model.zero_grad()
-#             base_loss.backward()
-        
-#         # 2. Compute gradient norm
-#         grads = [p.grad for p in model.parameters() if p.grad is not None]
-#         grad_norm = torch.linalg.norm(
-#             torch.stack([torch.linalg.norm(g) for g in grads])
-#         ) + 1e-12
-        
-#         # 3. Perturb parameters
-#         scale = rho / grad_norm
-#         epsilons = []
-#         for p in model.parameters():
-#             if p.grad is not None:
-#                 eps = p.grad * scale  # Moved scale calculation out
-#                 p.add_(eps)
-#                 epsilons.append(eps)
-        
-#         # 4. Compute perturbed loss
-#         adv_loss = F.cross_entropy(model(inputs), targets)
-        
-#         # 5. Restore parameters
-#         for p, eps in zip(
-#             (p for p in model.parameters() if p.grad is not None), 
-#             epsilons
-#         ):  
-#             p.sub_(eps)
-                
-#         total_sharpness += (adv_loss - base_loss).item()
-#         model.zero_grad()  # Clean up gradients
-
-#     return total_sharpness / min(num_batches, len(loader))
-
 @torch.no_grad()
 def get_sam_sharpness(model, loader, rho=0.05, num_batches=10):
+    model.eval()
+    device = next(model.parameters()).device
+    total_sharpness = 0.0
+
+    for batch_idx, (inputs, targets) in enumerate(iter(loader)):
+        if batch_idx >= num_batches:
+            break
+            
+        inputs, targets = inputs.to(device), targets.to(device)
+        
+        # 1. Compute base loss and gradients
+        with torch.enable_grad():
+            outputs = model(inputs)
+            base_loss = F.cross_entropy(outputs, targets)
+            model.zero_grad()
+            base_loss.backward()
+        
+        # 2. Compute gradient norm
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        grad_norm = torch.linalg.norm(
+            torch.stack([torch.linalg.norm(g) for g in grads])
+        ) + 1e-12
+        
+        # 3. Perturb parameters
+        scale = rho / grad_norm
+        epsilons = []
+        for p in model.parameters():
+            if p.grad is not None:
+                eps = p.grad * scale  # Moved scale calculation out
+                p.add_(eps)
+                epsilons.append(eps)
+        
+        # 4. Compute perturbed loss
+        adv_loss = F.cross_entropy(model(inputs), targets)
+        
+        # 5. Restore parameters
+        for p, eps in zip(
+            (p for p in model.parameters() if p.grad is not None), 
+            epsilons
+        ):  
+            p.sub_(eps)
+                
+        total_sharpness += (adv_loss - base_loss).item()
+        model.zero_grad()  # Clean up gradients
+
+    return total_sharpness / min(num_batches, len(loader))
+
+@torch.no_grad()
+def get_samlike_sharpness(model, loader, rho=0.05, num_batches=10):
     model.eval()
     device = next(model.parameters()).device
     total_sharpness = 0.0
@@ -203,66 +203,98 @@ def get_sam_sharpness(model, loader, rho=0.05, num_batches=10):
     return total_sharpness / min(num_batches, len(loader))
 
 
-sam_values = {}
-hessian_values = {}
-fisher_values = {}
-def sam_callback(name):
-    hessian_loader = CifarLoader('cifar10', train=True, batch_size=1000)
-    sam_values[name] = {i: [] for i in range(9)}
-    hessian_values[name] = {i: [] for i in range(9)}
-    fisher_values[name] = {i: [] for i in range(9)}
+def train_and_log(model, optimizer_config):
+    logs = {"train_acc": {}, "val_acc": {}, "gap": {}, "sam": {}, "hessian": {}, "fisher": {}}
+    metric_loader = CifarLoader('cifar10', train=True, batch_size=1000)
 
-
-    def callback_test(epoch, model, *args):
+    def callback_fn(epoch, model, training_accuracy, validation_accuracy):
         model.eval()
-        sam_sharp = get_sam_sharpness(model, hessian_loader)
-        sam_values[name][epoch].append(sam_sharp)
+        logs["train_acc"][epoch] = training_accuracy
+        logs["val_acc"][epoch] = validation_accuracy
+        logs["gap"][epoch] = training_accuracy - validation_accuracy
+        # logs["sam"][epoch] = get_sam_sharpness(model, metric_loader)
+        # logs["fisher"][epoch] = compute_fisher_rao_norm(model)
 
-        if epoch == 8:
-            print(f"Calculating Hessian and Fisher for epoch {epoch}...")
-            hess_sharp = pyhessian_sharpness(model, hessian_loader)
-            fisher_sharp = compute_fisher_rao_norm(model)
-        else:
-            hess_sharp = -1.0
-            fisher_sharp = -1.0
-        hessian_values[name][epoch].append(hess_sharp)
-        fisher_values[name][epoch].append(fisher_sharp)
+        # if epoch == 8:
+        #     # print(f"Calculating Hessian for epoch {epoch}...")
+        #     logs["hessian"][epoch] = pyhessian_sharpness(model, metric_loader)
 
         # print(f"[{name}] Epoch {epoch}  SAM Sharpness: {sam_sharp}  Hessian Top Eigenvalue: {hess_sharp}")
         model.train()
+
+    final_acc = train(optimizer_config, model, SGDConfig(), callback=callback_fn)
+
+    return final_acc, logs
+
+
+def worker(gpu_id, runs_per_gpu, optimizer_config):
+        all_acc, all_logs = [], []
+        torch.cuda.set_device(gpu_id)
+        model = CifarNet().to(f'cuda:{gpu_id}').to(memory_format=torch.channels_last)
+        # model = torch.compile(model, mode="max-autotune")
+
+        for run in tqdm(range(runs_per_gpu)) if gpu_id == 0 else range(runs_per_gpu):
+            acc, logs = train_and_log(model, optimizer_config)
+            all_acc.append(acc)
+            all_logs.append(logs)
+        
+        return all_acc, all_logs
+
+
+def train_distributed(gpus, runs_per_gpu, optimizer_config):
+    with mp.Pool(gpus) as pool:
+        out = [pool.apply_async(worker, args=(gpu_id, runs_per_gpu, optimizer_config)) for gpu_id in range(gpus)]
+        results = [p.get() for p in out]
     
-    return callback_test
+    all_accs, all_logs = [], []
+    for accs, logs_list in results:
+        all_accs.extend(accs)
+        all_logs.extend(logs_list)
+
+    return all_accs, all_logs
+
+
+def print_aggregated_metrics(name, all_accs, all_logs, metrics=None, epochs=None):
+    print(f"=== {name} Results ===")
+    print(f"Final Accuracy: {sum(all_accs) / len(all_accs):.2f} ± {np.std(all_accs):.2f}\n")
+
+    if not metrics:
+        metrics = list(all_logs[0].keys())
+    
+    if not epochs:
+        epochs = all_logs[0][metrics[0]].keys()
+
+    for metric in metrics:
+        for epoch in epochs:
+            vals = [log[metric][epoch] for log in all_logs if epoch in log[metric]]
+            if vals:
+                mean_val = sum(vals) / len(vals)
+                std_val = np.std(vals)
+                print(f"{metric} @ epoch {epoch}: {mean_val:.4f} ± {std_val:.4f}")
+            else:
+                print(f"{metric} @ epoch {epoch}: [No Data]")
+        print()
+    print("\n")
+
+
+def main():
+    gpus = 4
+    runs_per_gpu = 10
+
+    print("Performing Warmup...")
+    train_distributed(gpus, 1, MuonConfig())
+
+    print("Running SGD Experiments...")
+    sgd_accs, sgd_logs = train_distributed(gpus, runs_per_gpu, SGDConfig())
+
+    print("Running Muon Experiments...")
+    muon_accs, muon_logs = train_distributed(gpus, runs_per_gpu, MuonConfig())
+
+    print_aggregated_metrics("SGD", sgd_accs, sgd_logs)
+    print_aggregated_metrics("Muon", muon_accs, muon_logs)
 
 
 if __name__ == "__main__":
-
-    device = "cuda"
-    model = CifarNet().to(device).to(memory_format=torch.channels_last)
-    model = torch.compile(model, mode="max-autotune")
-    num_runs = 2
-
-    # 1. Warmup
-    print("Performing Warmup...")
-    train("Warmup", model, MuonConfig(batch_size=2000))
-
-    sgd_callback = sam_callback("SGD")
-    sgd_accs = torch.tensor([train(run, model, SGDConfig(), callback=sgd_callback) for run in tqdm(range(num_runs))])
-
-    muon_callback = sam_callback("Muon")
-    muon_accs = torch.tensor([train(run, model, MuonConfig(), callback=muon_callback) for run in tqdm(range(num_runs))])
-
-    print("\nSGD  - Mean: %.4f    Std: %.4f" % (sgd_accs.mean(), sgd_accs.std()))
-    print(f" SAM0 - Mean: {torch.tensor(sam_values['SGD'][0]).mean()}    Std: {torch.tensor(sam_values['SGD'][0]).std()}")
-    print(f" SAM8 - Mean: {torch.tensor(sam_values['SGD'][8]).mean()}    Std: {torch.tensor(sam_values['SGD'][8]).std()}")
-    print(f" HESS0 - Mean: {torch.tensor(hessian_values['SGD'][0]).mean()}    Std: {torch.tensor(hessian_values['SGD'][0]).std()}")
-    print(f" HESS8 - Mean: {torch.tensor(hessian_values['SGD'][8]).mean()}    Std: {torch.tensor(hessian_values['SGD'][8]).std()}")
-    print(f" Fish0 - Mean: {torch.tensor(fisher_values['SGD'][0]).mean()}    Std: {torch.tensor(fisher_values['SGD'][0]).std()}")
-    print(f" Fish8 - Mean: {torch.tensor(fisher_values['SGD'][8]).mean()}    Std: {torch.tensor(fisher_values['SGD'][8]).std()}")
-
-    print("\nMuon - Mean: %.4f    Std: %.4f" % (muon_accs.mean(), muon_accs.std()))
-    print(f" SAM0 - Mean: {torch.tensor(sam_values['Muon'][0]).mean()}    Std: {torch.tensor(sam_values['Muon'][0]).std()}")
-    print(f" SAM8 - Mean: {torch.tensor(sam_values['Muon'][8]).mean()}    Std: {torch.tensor(sam_values['Muon'][8]).std()}")
-    print(f" HESS0 - Mean: {torch.tensor(hessian_values['Muon'][0]).mean()}    Std: {torch.tensor(hessian_values['Muon'][0]).std()}")
-    print(f" HESS8 - Mean: {torch.tensor(hessian_values['Muon'][8]).mean()}    Std: {torch.tensor(hessian_values['Muon'][8]).std()}")
-    print(f" Fish0 - Mean: {torch.tensor(fisher_values['Muon'][0]).mean()}    Std: {torch.tensor(fisher_values['Muon'][0]).std()}")
-    print(f" Fish8 - Mean: {torch.tensor(fisher_values['Muon'][8]).mean()}    Std: {torch.tensor(fisher_values['Muon'][8]).std()}")
+    main()
+    
+    
