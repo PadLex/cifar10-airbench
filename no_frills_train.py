@@ -2,9 +2,13 @@ import torch
 from airbench import infer, evaluate, CifarLoader
 from airbench.lib_nofrills import train94, make_net94
 from pathlib import Path
+import os
+import time
 
-CHECKPOINT_FOLDER = Path("/work/scratch/deep-learning/checkpoints/")
 CHECKPOINT_NAME = "test"
+
+username = os.getenv("USER")
+CHECKPOINT_FOLDER = Path(f"/work/scratch/{username}/deep-learning/checkpoints/")
 
 loader = CifarLoader(
     'cifar10',
@@ -14,6 +18,7 @@ loader = CifarLoader(
     altflip=False,
 )
 
+print(f"{time.ctime()} Training starting...", flush=True)
 net = train94(label_smoothing=0)
 
 # save
