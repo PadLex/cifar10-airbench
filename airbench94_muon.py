@@ -94,6 +94,16 @@ class OptimizerConfig:
         """Create and return optimizer(s) for the model. Must be implemented by subclasses."""
         raise NotImplementedError
 
+    def represent(self):
+        """Return a dictionary representation of the optimizer configuration."""
+        return {
+            "name": self.name,
+            "batch_size": self.batch_size,
+            "bias_lr": self.bias_lr,
+            "head_lr": self.head_lr,
+            "wd_factor": self.wd / self.batch_size,
+        }
+
 class MuonConfig(OptimizerConfig):
     def __init__(self, batch_size=2000, bias_lr=0.053, head_lr=0.67, wd_factor=2e-6,
                  muon_lr=0.24, muon_momentum=0.6, muon_nesterov=True,
@@ -121,6 +131,17 @@ class MuonConfig(OptimizerConfig):
                          nesterov=self.muon_nesterov)
         
         return [optimizer1, optimizer2]
+    
+    def represent(self):
+        base_repr = super().represent()
+        base_repr.update({
+            "muon_lr": self.muon_lr,
+            "muon_momentum": self.muon_momentum,
+            "muon_nesterov": self.muon_nesterov,
+            "sgd_momentum": self.sgd_momentum,
+            "sgd_nesterov": self.sgd_nesterov,
+        })
+        return base_repr
 
 class SGDConfig(OptimizerConfig):
     def __init__(self, batch_size=2000, bias_lr=0.053, head_lr=0.67, wd_factor=2e-6,
@@ -145,30 +166,49 @@ class SGDConfig(OptimizerConfig):
                                    nesterov=self.nesterov, fused=True)
         
         return [optimizer]
+    
+    def represent(self):
+        base_repr = super().represent()
+        base_repr.update({
+            "filter_lr": self.filter_lr,
+            "momentum": self.momentum,
+            "nesterov": self.nesterov,
+        })
+        return base_repr
 
-# Example for future Adam support:
-# class AdamConfig(OptimizerConfig):
-#     def __init__(self, batch_size=2000, bias_lr=0.053, head_lr=0.67, wd_factor=2e-6,
-#                  filter_lr=0.001, betas=(0.9, 0.999), eps=1e-8):
-#         super().__init__('Adam', batch_size, bias_lr, head_lr, wd_factor)
-#         self.filter_lr = filter_lr
-#         self.betas = betas
-#         self.eps = eps
-#     
-#     def create_optimizers(self, model):
-#         filter_params = [p for p in model.parameters() if len(p.shape) == 4 and p.requires_grad]
-#         norm_biases = [p for n, p in model.named_parameters() if "norm" in n and p.requires_grad]
-#         
-#         param_configs = [
-#             dict(params=[model.whiten.bias], lr=self.bias_lr, weight_decay=self.wd/self.bias_lr),
-#             dict(params=norm_biases, lr=self.bias_lr, weight_decay=self.wd/self.bias_lr),
-#             dict(params=[model.head.weight], lr=self.head_lr, weight_decay=self.wd/self.head_lr),
-#             dict(params=filter_params, lr=self.filter_lr, weight_decay=self.wd/self.filter_lr)
-#         ]
-#         
-#         optimizer = torch.optim.Adam(param_configs, betas=self.betas, eps=self.eps, fused=True)
-#         
-#         return [optimizer]
+class AdamConfig(OptimizerConfig):
+    def __init__(self, batch_size=2000, bias_lr=0.053, head_lr=0.67, wd_factor=2e-6,
+                 filter_lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8):
+        super().__init__('Adam', batch_size, bias_lr, head_lr, wd_factor)
+        self.filter_lr = filter_lr
+        self.betas = (beta1, beta2)
+        self.eps = eps
+    
+    def create_optimizers(self, model):
+        filter_params = [p for p in model.parameters() if len(p.shape) == 4 and p.requires_grad]
+        norm_biases = [p for n, p in model.named_parameters() if "norm" in n and p.requires_grad]
+        
+        param_configs = [
+            dict(params=[model.whiten.bias], lr=self.bias_lr, weight_decay=self.wd/self.bias_lr),
+            dict(params=norm_biases, lr=self.bias_lr, weight_decay=self.wd/self.bias_lr),
+            dict(params=[model.head.weight], lr=self.head_lr, weight_decay=self.wd/self.head_lr),
+            dict(params=filter_params, lr=self.filter_lr, weight_decay=self.wd/self.filter_lr)
+        ]
+        
+        optimizer = torch.optim.Adam(param_configs, betas=self.betas, eps=self.eps, fused=True)
+        
+        return [optimizer]
+    
+    def represent(self):
+        base_repr = super().represent()
+        base_repr.update({
+            "filter_lr": self.filter_lr,
+            "beta1": self.betas[0],
+            "beta2": self.betas[1],
+            "eps": self.eps,
+        })
+        return base_repr
+
 
 #############################################
 #                DataLoader                 #
@@ -422,7 +462,7 @@ def evaluate(model, loader, tta_level=0):
 #                Training                  #
 ############################################
 
-def train(run, model, optimizer_config=None, verbose=False, callback=None):
+def train(run, model, optimizer_config=None, epochs=8, verbose=False, callback=None):
     if optimizer_config is None:
         optimizer_config = MuonConfig()
     
@@ -436,7 +476,7 @@ def train(run, model, optimizer_config=None, verbose=False, callback=None):
     if run == "warmup":
         # The only purpose of the first run is to warmup the compiled model, so we can use dummy data
         train_loader.labels = torch.randint(0, 10, size=(len(train_loader.labels),), device=train_loader.labels.device)
-    total_train_steps = ceil(8 * len(train_loader))
+    total_train_steps = ceil(epochs * len(train_loader))
     whiten_bias_train_steps = ceil(3 * len(train_loader))
 
     # Create optimizers using the configuration
@@ -529,6 +569,10 @@ def train(run, model, optimizer_config=None, verbose=False, callback=None):
 
     return tta_val_acc
 
+def train_and_print(model, optimizer_config, name, epochs=8, runs=10, verbose=False):
+    accs = torch.tensor([train(run, model, optimizer_config, epochs=epochs, verbose=verbose) for run in range(runs)])
+    print(f"\n{name} - Mean: {accs.mean():.4f}    Std: {accs.std():.4f}\n")
+
 if __name__ == "__main__":
     device = "cuda"
     model = CifarNet().to(device).to(memory_format=torch.channels_last)
@@ -536,12 +580,35 @@ if __name__ == "__main__":
 
     # 1. Warmup
     print("Performing Warmup...")
-    train("Warmup", model, MuonConfig(batch_size=2000))
+    train("Warmup", model)
+
+    epocs = 8
+    runs = 50
 
     # 2. Test Muon
-    muon_accs = torch.tensor([train(run, model, MuonConfig(), verbose=True) for run in range(10)])
-    print("\nMuon - Mean: %.4f    Std: %.4f" % (muon_accs.mean(), muon_accs.std()))
+    train_and_print(model, MuonConfig(), "Muon", epochs=epocs, runs=runs)
+
+    tuned_muon_config_8 = MuonConfig(muon_lr=0.2574, head_lr=0.7136, muon_momentum=0.6576, bias_lr=0.0853, sgd_momentum=0.8802)
+    train_and_print(model, tuned_muon_config_8, "Tuned Muon 8", epochs=epocs, runs=runs)
+
+    tuned_muon_config_16 = MuonConfig(muon_lr=0.3656, head_lr=0.9226, muon_momentum=0.1395, bias_lr=0.05492, sgd_momentum=0.4507)
+    train_and_print(model, tuned_muon_config_16, "Tuned Muon 16", epochs=epocs, runs=runs)
 
     # 3. Test SGD
-    sgd_accs = torch.tensor([train(run, model, SGDConfig(), verbose=True) for run in range(10)])
-    print("\nSGD  - Mean: %.4f    Std: %.4f" % (sgd_accs.mean(), sgd_accs.std()))
+    train_and_print(model, SGDConfig(), "SGD", epochs=epocs, runs=runs)
+
+    tuned_sgd_config_8 = SGDConfig(filter_lr=0.4756, head_lr=0.8182, bias_lr=0.01141, momentum=0.9187)
+    train_and_print(model, tuned_sgd_config_8, "Tuned SGD 8", epochs=epocs, runs=runs)
+
+    tuned_sgd_config_16 = SGDConfig(filter_lr=0.2836, head_lr=0.7920, bias_lr=0.01435, momentum=0.8926)
+    train_and_print(model, tuned_sgd_config_16, "Tuned SGD 16", epochs=epocs, runs=runs)
+    
+    # 4. Test Adam
+    train_and_print(model, AdamConfig(), "Adam", epochs=epocs, runs=runs)
+
+    tuned_adam_config_8 = AdamConfig(filter_lr=0.004696, head_lr=0.8013, bias_lr=0.09306, beta1=0.8244, beta2=0.9956)
+    train_and_print(model, tuned_adam_config_8, "Tuned Adam 8", epochs=epocs, runs=runs)
+
+    tuned_adam_config_16 = AdamConfig(filter_lr=0.008248, head_lr=0.9818, bias_lr=0.03983, beta1=0.8278, beta2=0.9982)
+    train_and_print(model, tuned_adam_config_16, "Tuned Adam 16", epochs=epocs, runs=runs)
+
