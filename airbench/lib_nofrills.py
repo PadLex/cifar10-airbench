@@ -7,6 +7,7 @@ from .utils import train, CifarLoader
 #############################################
 
 import torch
+torch.manual_seed(42)
 from torch import nn
 import torch.nn.functional as F
 
