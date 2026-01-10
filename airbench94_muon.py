@@ -144,8 +144,7 @@ class MuonConfig(OptimizerConfig):
         return base_repr
 
 class SGDConfig(OptimizerConfig):
-    def __init__(self, batch_size=2000, bias_lr=0.053, head_lr=0.67, wd_factor=2e-6,
-                 filter_lr=0.24, momentum=0.9, nesterov=True):
+    def __init__(self, batch_size=2000, filter_lr=0.4756, head_lr=0.8182, bias_lr=0.01141, momentum=0.9187, wd_factor=2e-6, nesterov=True):
         super().__init__('SGD', batch_size, bias_lr, head_lr, wd_factor)
         self.filter_lr = filter_lr
         self.momentum = momentum
@@ -177,8 +176,7 @@ class SGDConfig(OptimizerConfig):
         return base_repr
 
 class AdamConfig(OptimizerConfig):
-    def __init__(self, batch_size=2000, bias_lr=0.053, head_lr=0.67, wd_factor=2e-6,
-                 filter_lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8):
+    def __init__(self, batch_size=2000, filter_lr=0.004696, head_lr=0.8013, bias_lr=0.09306, beta1=0.8244, beta2=0.9956, wd_factor=2e-6, eps=1e-8):
         super().__init__('Adam', batch_size, bias_lr, head_lr, wd_factor)
         self.filter_lr = filter_lr
         self.betas = (beta1, beta2)
@@ -571,7 +569,8 @@ def train(run, model, optimizer_config=None, epochs=8, verbose=False, callback=N
 
 def train_and_print(model, optimizer_config, name, epochs=8, runs=10, verbose=False):
     accs = torch.tensor([train(run, model, optimizer_config, epochs=epochs, verbose=verbose) for run in range(runs)])
-    print(f"\n{name} - Mean: {accs.mean():.4f}    Std: {accs.std():.4f}\n")
+    print(f"\n{name} - Mean: {accs.mean():.4f}    Std: {accs.std():.4f}")
+    print(accs.tolist())
 
 if __name__ == "__main__":
     device = "cuda"
@@ -586,16 +585,18 @@ if __name__ == "__main__":
     runs = 50
 
     # 2. Test Muon
-    train_and_print(model, MuonConfig(), "Muon", epochs=epocs, runs=runs)
+    # train_and_print(model, MuonConfig(), "Muon", epochs=epocs, runs=runs)
 
-    tuned_muon_config_8 = MuonConfig(muon_lr=0.2574, head_lr=0.7136, muon_momentum=0.6576, bias_lr=0.0853, sgd_momentum=0.8802)
-    train_and_print(model, tuned_muon_config_8, "Tuned Muon 8", epochs=epocs, runs=runs)
+    # tuned_muon_config_8 = MuonConfig(muon_lr=0.2574, head_lr=0.7136, muon_momentum=0.6576, bias_lr=0.0853, sgd_momentum=0.8802)
+    # train_and_print(model, tuned_muon_config_8, "Tuned Muon 8", epochs=epocs, runs=runs)
 
-    tuned_muon_config_16 = MuonConfig(muon_lr=0.3656, head_lr=0.9226, muon_momentum=0.1395, bias_lr=0.05492, sgd_momentum=0.4507)
-    train_and_print(model, tuned_muon_config_16, "Tuned Muon 16", epochs=epocs, runs=runs)
+    # tuned_muon_config_16 = MuonConfig(muon_lr=0.3656, head_lr=0.9226, muon_momentum=0.1395, bias_lr=0.05492, sgd_momentum=0.4507)
+    # train_and_print(model, tuned_muon_config_16, "Tuned Muon 16", epochs=epocs, runs=runs)
 
     # 3. Test SGD
     train_and_print(model, SGDConfig(), "SGD", epochs=epocs, runs=runs)
+
+    train_and_print(model, SGDConfig(), "SGD2", epochs=epocs, runs=runs)
 
     tuned_sgd_config_8 = SGDConfig(filter_lr=0.4756, head_lr=0.8182, bias_lr=0.01141, momentum=0.9187)
     train_and_print(model, tuned_sgd_config_8, "Tuned SGD 8", epochs=epocs, runs=runs)
@@ -604,11 +605,11 @@ if __name__ == "__main__":
     train_and_print(model, tuned_sgd_config_16, "Tuned SGD 16", epochs=epocs, runs=runs)
     
     # 4. Test Adam
-    train_and_print(model, AdamConfig(), "Adam", epochs=epocs, runs=runs)
+    # train_and_print(model, AdamConfig(), "Adam", epochs=epocs, runs=runs)
 
-    tuned_adam_config_8 = AdamConfig(filter_lr=0.004696, head_lr=0.8013, bias_lr=0.09306, beta1=0.8244, beta2=0.9956)
-    train_and_print(model, tuned_adam_config_8, "Tuned Adam 8", epochs=epocs, runs=runs)
+    # tuned_adam_config_8 = AdamConfig(filter_lr=0.004696, head_lr=0.8013, bias_lr=0.09306, beta1=0.8244, beta2=0.9956)
+    # train_and_print(model, tuned_adam_config_8, "Tuned Adam 8", epochs=epocs, runs=runs)
 
-    tuned_adam_config_16 = AdamConfig(filter_lr=0.008248, head_lr=0.9818, bias_lr=0.03983, beta1=0.8278, beta2=0.9982)
-    train_and_print(model, tuned_adam_config_16, "Tuned Adam 16", epochs=epocs, runs=runs)
+    # tuned_adam_config_16 = AdamConfig(filter_lr=0.008248, head_lr=0.9818, bias_lr=0.03983, beta1=0.8278, beta2=0.9982)
+    # train_and_print(model, tuned_adam_config_16, "Tuned Adam 16", epochs=epocs, runs=runs)
 

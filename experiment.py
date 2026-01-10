@@ -1,6 +1,6 @@
 from typing import final
 import uuid
-from airbench94_muon import CifarNet, train, MuonConfig, SGDConfig, CifarLoader, BatchNorm
+from airbench94_muon import CifarNet, train, MuonConfig, SGDConfig, CifarLoader, BatchNorm, AdamConfig
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,8 +11,12 @@ from itertools import islice
 # import loss_landscapes.metrics as metrics
 import torch.multiprocessing as mp
 import numpy as np
+import wandb
+import time
 
 import copy
+
+EXPERIMENT_ID = str(uuid.uuid4())[:8]
 
 @torch.no_grad()
 def compute_fisher_rao_norm(model, input_shape=(3, 32, 32)):
@@ -98,7 +102,7 @@ def pyhessian_sharpness(model, loader, num_batches=10):
     # Calculate relative sharpness:
     relative_sharpness = lambda_max * total_norm_sq.item() / num_of_params
 
-    return relative_sharpness
+    return lambda_max, relative_sharpness
 
 @torch.no_grad()
 def get_sam_sharpness(model, loader, rho=0.05, num_batches=10):
@@ -204,41 +208,61 @@ def get_samlike_sharpness(model, loader, rho=0.05, num_batches=10):
 
 
 def train_and_log(model, optimizer_config):
-    logs = {"train_acc": {}, "val_acc": {}, "gap": {}, "sam": {}, "hessian": {}, "fisher": {}}
+    logs = []
     metric_loader = CifarLoader('cifar10', train=True, batch_size=1000)
 
     def callback_fn(epoch, model, training_accuracy, validation_accuracy):
         model.eval()
-        logs["train_acc"][epoch] = training_accuracy
-        logs["val_acc"][epoch] = validation_accuracy
-        logs["gap"][epoch] = training_accuracy - validation_accuracy
-        # logs["sam"][epoch] = get_sam_sharpness(model, metric_loader)
-        # logs["fisher"][epoch] = compute_fisher_rao_norm(model)
 
-        # if epoch == 8:
-        #     # print(f"Calculating Hessian for epoch {epoch}...")
-        #     logs["hessian"][epoch] = pyhessian_sharpness(model, metric_loader)
+        log = {
+            "epoch": epoch,
+            "train_acc": training_accuracy,
+            "val_acc": validation_accuracy,
+            "gap": training_accuracy - validation_accuracy,
+            "sam_sharpness": get_sam_sharpness(model, metric_loader),
+            # "fisher_rao_norm": compute_fisher_rao_norm(model),
+        }
+
+        if epoch == 8:
+            # print(f"Calculating Hessian for epoch {epoch}...")
+            log["hessian"], log["relative_hessian"] = pyhessian_sharpness(model, metric_loader)
+        
+        wandb.log(log)
+        logs.append(log)
 
         # print(f"[{name}] Epoch {epoch}  SAM Sharpness: {sam_sharp}  Hessian Top Eigenvalue: {hess_sharp}")
         model.train()
+    
+    start = time.time()
+    wandb.init(project="cifar10-airbench", group=f"experiment-{EXPERIMENT_ID}", config=optimizer_config.represent())
+    middle = time.time()
 
-    final_acc = train(optimizer_config, model, SGDConfig(), callback=callback_fn)
+    final_acc = train(optimizer_config, model, optimizer_config, callback=callback_fn, epochs=16)
+
+    post = time.time()
+    wandb.log({"tta_val_accuracy": final_acc, "tta_gap": logs[-1]["val_acc"] - final_acc})
+    wandb.finish()
+    end = time.time()
+
+    wasted_time = (middle - start) + (end - post)
+    
+    print(f"Wasted Time: {wasted_time:.2f}s of {end - start:.2f}s total ({100.0 * wasted_time / (end - start):.2f}%)")
 
     return final_acc, logs
 
 
 def worker(gpu_id, runs_per_gpu, optimizer_config):
-        all_acc, all_logs = [], []
-        torch.cuda.set_device(gpu_id)
-        model = CifarNet().to(f'cuda:{gpu_id}').to(memory_format=torch.channels_last)
-        # model = torch.compile(model, mode="max-autotune")
+    all_acc, all_logs = [], []
+    torch.cuda.set_device(gpu_id)
+    model = CifarNet().to(f'cuda:{gpu_id}').to(memory_format=torch.channels_last)
+    model = torch.compile(model, mode="max-autotune")
 
-        for run in tqdm(range(runs_per_gpu)) if gpu_id == 0 else range(runs_per_gpu):
-            acc, logs = train_and_log(model, optimizer_config)
-            all_acc.append(acc)
-            all_logs.append(logs)
+    for run in tqdm(range(runs_per_gpu)) if gpu_id == 0 else range(runs_per_gpu):
+        acc, logs = train_and_log(model, optimizer_config)
+        all_acc.append(acc)
+        all_logs.append(logs)
         
-        return all_acc, all_logs
+    return all_acc, all_logs
 
 
 def train_distributed(gpus, runs_per_gpu, optimizer_config):
@@ -256,17 +280,17 @@ def train_distributed(gpus, runs_per_gpu, optimizer_config):
 
 def print_aggregated_metrics(name, all_accs, all_logs, metrics=None, epochs=None):
     print(f"=== {name} Results ===")
-    print(f"Final Accuracy: {sum(all_accs) / len(all_accs):.2f} ± {np.std(all_accs):.2f}\n")
+    print(f"Final Accuracy: {sum(all_accs) / len(all_accs):.4f} ± {np.std(all_accs):.4f}\n")
 
     if not metrics:
-        metrics = list(all_logs[0].keys())
+        metrics = list(all_logs[0][0].keys())
     
     if not epochs:
-        epochs = all_logs[0][metrics[0]].keys()
+        epochs = range(len(all_logs[0]))
 
-    for metric in metrics:
-        for epoch in epochs:
-            vals = [log[metric][epoch] for log in all_logs if epoch in log[metric]]
+    for epoch in epochs:
+        for metric in metrics:
+            vals = [log[epoch][metric] for log in all_logs if metric in log[epoch]]
             if vals:
                 mean_val = sum(vals) / len(vals)
                 std_val = np.std(vals)
@@ -279,22 +303,25 @@ def print_aggregated_metrics(name, all_accs, all_logs, metrics=None, epochs=None
 
 def main():
     gpus = 4
-    runs_per_gpu = 10
+    runs_per_gpu = 20
 
     print("Performing Warmup...")
     train_distributed(gpus, 1, MuonConfig())
 
-    print("Running SGD Experiments...")
-    sgd_accs, sgd_logs = train_distributed(gpus, runs_per_gpu, SGDConfig())
-
     print("Running Muon Experiments...")
     muon_accs, muon_logs = train_distributed(gpus, runs_per_gpu, MuonConfig())
 
-    print_aggregated_metrics("SGD", sgd_accs, sgd_logs)
-    print_aggregated_metrics("Muon", muon_accs, muon_logs)
+    print("Running SGD Experiments...")
+    sgd_accs, sgd_logs = train_distributed(gpus, runs_per_gpu, SGDConfig())
 
+    print("Running Adam Experiments...")
+    adam_accs, adam_logs = train_distributed(gpus, runs_per_gpu, AdamConfig())
+
+    print_aggregated_metrics("Muon", muon_accs, muon_logs)
+    print_aggregated_metrics("SGD", sgd_accs, sgd_logs)
+    print_aggregated_metrics("Adam", adam_accs, adam_logs)
+
+    print(f"See https://wandb.ai/padlex/cifar10-airbench -> experiment-{EXPERIMENT_ID} for detailed results.")
 
 if __name__ == "__main__":
     main()
-    
-    
